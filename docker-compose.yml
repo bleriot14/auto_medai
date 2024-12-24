@@ -1,0 +1,286 @@
+version: "3.8"
+
+x-n8n: &service-n8n
+  image: n8nio/n8n:latest
+  environment:
+    - DB_TYPE=postgresdb
+    - DB_POSTGRESDB_HOST=postgres
+    - DB_POSTGRESDB_USER=${POSTGRES_USER}
+    - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+    - N8N_DIAGNOSTICS_ENABLED=false
+    - N8N_PERSONALIZATION_ENABLED=false
+    - WEBHOOK_URL=${WEBHOOK_URL}
+    - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+    - N8N_USER_MANAGEMENT_JWT_SECRET=${N8N_USER_MANAGEMENT_JWT_SECRET}
+    - N8N_SECURE_COOKIE=${N8N_SECURE_COOKIE}
+    - NODE_FUNCTION_ALLOW_BUILTIN=*
+    - NODE_FUNCTION_ALLOW_EXTERNAL=*
+  links:
+    - postgres
+
+x-logging: &logging
+  logging:
+    driver: 'json-file'
+    options:
+      max-size: 100m
+      max-file: '2'
+
+services:
+  #################################################################
+  # 1) İlk olarak klonlama işlemini yapan servis:
+  #################################################################
+  stable-diffusion-webui-docker-clone:
+    container_name: stable-diffusion-webui-docker-clone
+    image: alpine/git:latest
+    restart: "no"  # İş bitince yeniden başlama
+    working_dir: /workspace
+    volumes:
+      - .:/workspace  # docker-compose.yml'in bulunduğu klasörü /workspace olarak mount et
+    entrypoint: /bin/sh
+    command:
+      - "-c"
+      - >
+        echo 'Klonlama başlıyor...' &&
+        if [ -d stable-diffusion-webui-docker ]; then
+          echo 'Klon zaten var!'
+        else
+          git clone https://github.com/AbdBarho/stable-diffusion-webui-docker.git
+        fi &&
+        echo 'Klonlama tamamlandı!'
+  #################################################################
+  # 2) Diğer servisler: Tümü, stable-diffusion-webui-docker-clone
+  # servisinin başarıyla tamamlanmasına "depends_on" ile bağlı.
+  #################################################################
+
+  localai:
+    container_name: localai
+    hostname: localai
+    image: localai/localai:latest-gpu-nvidia-cuda-12
+    restart: unless-stopped
+    environment:
+      - MODELS_PATH=${MODELS_PATH}
+      - LOCALAI_P2P=false
+      - LOCALAI_PARALLEL_REQUESTS=false
+    ports:
+      - 8080:8080
+    volumes:
+      - ./models:/models:cached
+      - ./images/:/tmp/generated/images/
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+    <<: *logging
+    depends_on:
+      stable-diffusion-webui-docker-clone:
+        condition: service_completed_successfully
+
+  llm-proxy:
+    container_name: llm-proxy
+    hostname: llm-proxy
+    image: ghcr.io/j4ys0n/llm-proxy:1.4.7
+    restart: unless-stopped
+    ports:
+      - 3001:3001
+    env_file:
+      - ./.llm-proxy.env
+    volumes:
+      - ./.llm-proxy.env:/usr/src/app/.env
+    <<: *logging
+    depends_on:
+      stable-diffusion-webui-docker-clone:
+        condition: service_completed_successfully
+
+  webui:
+    container_name: webui
+    hostname: webui
+    image: ghcr.io/open-webui/open-webui:main
+    restart: unless-stopped
+    ports:
+      - 3000:3000
+    environment:
+      - PORT=3000
+      - OPENAI_API_BASE=${OPENAI_API_BASE}
+      - CUDA_VISIBLE_DEVICES=0
+    volumes:
+      - ./open-webui:/app/backend/data
+    <<: *logging
+    depends_on:
+      stable-diffusion-webui-docker-clone:
+        condition: service_completed_successfully
+
+  redis:
+    container_name: redis
+    hostname: redis
+    image: docker.io/valkey/valkey:8-bookworm
+    restart: unless-stopped
+    command: valkey-server --save 30 1 --loglevel ${REDIS_LOG_LEVEL}
+    volumes:
+      - ./valkey-data:/data
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETGID
+      - SETUID
+      - DAC_OVERRIDE
+    <<: *logging
+    depends_on:
+      stable-diffusion-webui-docker-clone:
+        condition: service_completed_successfully
+
+  searxng:
+    container_name: searxng
+    hostname: searxng
+    image: docker.io/searxng/searxng:latest
+    restart: unless-stopped
+    ports:
+      - 8081:8080
+    environment:
+      - SEARXNG_BASE_URL=${SEARXNG_BASE_URL}
+      - UWSGI_WORKERS=${SEARXNG_UWSGI_WORKERS}
+      - UWSGI_THREADS=${SEARXNG_UWSGI_THREADS}
+      - CUDA_VISIBLE_DEVICES=0
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    <<: *logging
+    depends_on:
+      stable-diffusion-webui-docker-clone:
+        condition: service_completed_successfully
+
+  stable-diffusion-download:
+    container_name: stable-diffusion-download
+    build: ./stable-diffusion-webui-docker/services/download/
+    image: comfy-download
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - CUDA_VISIBLE_DEVICES=0
+    volumes:
+      - ./stable-diffusion-webui-docker/data:/data
+    <<: *logging
+    depends_on:
+      stable-diffusion-webui-docker-clone:
+        condition: service_completed_successfully
+
+  comfy-ui:
+    container_name: comfy-ui
+    hostname: comfy-ui
+    build: ./stable-diffusion-webui-docker/services/comfy/
+    image: comfy-ui
+    restart: unless-stopped
+    ports:
+      - 9443:7860
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - CLI_ARGS=
+      - CUDA_VISIBLE_DEVICES=0
+    volumes:
+      - ./stable-diffusion-webui-docker/data:/data
+      - ./stable-diffusion-webui-docker/output:/output
+    stop_signal: SIGKILL
+    tty: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu, compute, utility]
+    <<: *logging
+    depends_on:
+      stable-diffusion-webui-docker-clone:
+        condition: service_completed_successfully
+
+  postgres:
+    container_name: postgres
+    hostname: postgres
+    image: postgres:16-alpine
+    restart: unless-stopped
+    ports:
+      - 5432:5432
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=n8n
+    volumes:
+      - ./postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -h localhost -U ${POSTGRES_USER} -d ${POSTGRES_DB}']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    <<: *logging
+    depends_on:
+      stable-diffusion-webui-docker-clone:
+        condition: service_completed_successfully
+
+  qdrant:
+    container_name: qdrant
+    hostname: qdrant
+    image: qdrant/qdrant
+    restart: unless-stopped
+    ports:
+      - 6333:6333
+    volumes:
+      - ./qdrant:/qdrant/storage
+    <<: *logging
+    depends_on:
+      stable-diffusion-webui-docker-clone:
+        condition: service_completed_successfully
+
+  n8n-import:
+    <<: [*service-n8n, *logging]
+    container_name: n8n-import
+    entrypoint: /bin/sh
+    command:
+      - "-c"
+      - "n8n import:credentials --separate --input=/backup/credentials && n8n import:workflow --separate --input=/backup/workflows"
+    volumes:
+      - ./n8n/backup:/backup
+    depends_on:
+      postgres:
+        condition: service_healthy
+      stable-diffusion-webui-docker-clone:
+        condition: service_completed_successfully
+
+  n8n:
+    <<: [*service-n8n, *logging]
+    container_name: n8n
+    hostname: n8n
+    restart: unless-stopped
+    ports:
+      - 5678:5678
+    volumes:
+      - ./n8n/data:/home/node/.n8n
+      - ./n8n/backup:/backup
+      - ./shared:/data/shared
+    depends_on:
+      postgres:
+        condition: service_healthy
+      n8n-import:
+        condition: service_completed_successfully
+      stable-diffusion-webui-docker-clone:
+        condition: service_completed_successfully
+
+  lmstudio:
+    image: noneabove1182/lmstudio-cuda:latest
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu, compute, utility]
+    depends_on:
+      stable-diffusion-webui-docker-clone:
+        condition: service_completed_successfully
